@@ -37,8 +37,8 @@ This is the full requirements specification for building TRINITY as a native mac
 ### Local LLM
 | Component | Choice | Why |
 |-----------|--------|-----|
-| **Runtime** | Ollama | Single binary, Metal GPU acceleration, OpenAI-compatible REST API at `localhost:11434`, 100+ model support |
-| **Default Model** | `llama3.1:8b` (4.7GB) | Best balance of quality and speed for 8GB+ Macs. Fallback: `phi3:mini` (2.3GB) for low-RAM Macs |
+| **Runtime** | Ollama (with `keep_alive: 5m`) | Single binary, Metal GPU acceleration, OpenAI-compatible REST API at `localhost:11434`, 100+ models, auto-unloads after idle |
+| **Default Model** | `phi3:mini` Q4 quantized (~1.8GB RAM) | Strong reasoning, low footprint, runs on 8GB Macs comfortably. Upgrade option: `llama3.2:3b` (~2GB) or `llama3.1:8b` (~4.7GB) for power users |
 | **Model Management** | Ollama CLI via Tauri sidecar | Pull, list, delete models from within the app |
 | **API Format** | OpenAI-compatible `/api/chat` | Streaming via NDJSON, nearly identical to existing Gemini streaming pattern |
 
@@ -81,7 +81,7 @@ This is the full requirements specification for building TRINITY as a native mac
 │  │ Ollama       │    │  SQLite (local)         │  │
 │  │ (sidecar)    │    │  • conversations        │  │
 │  │              │    │  • messages              │  │
-│  │ llama3.1:8b  │    │  • memories              │  │
+│  │ phi3:mini  │    │  • memories              │  │
 │  │              │    │  • user prefs            │  │
 │  └──────────────┘    └────────────────────────┘  │
 └─────────────────────────────────────────────────┘
@@ -119,7 +119,7 @@ Decision tree:
 
 **First-Run Setup:**
 1. App detects no Ollama installed → prompt to download (link to ollama.com) or bundle it
-2. App detects Ollama but no model → auto-pull `llama3.1:8b` with progress UI
+2. App detects Ollama but no model → auto-pull `phi3:mini` with progress UI
 3. Show download progress bar (Ollama pull streams progress as JSON)
 4. Store model preference in local config
 
@@ -127,7 +127,7 @@ Decision tree:
 ```
 POST http://localhost:11434/api/chat
 {
-  "model": "llama3.1:8b",
+  "model": "phi3:mini",
   "messages": [
     {"role": "system", "content": "<personality_system_prompt>"},
     {"role": "user", "content": "Hello ARIA"}
@@ -172,7 +172,7 @@ CREATE TABLE messages (
   personality TEXT,
   source TEXT DEFAULT 'text',  -- 'text' | 'voice'
   provider TEXT,               -- 'gemini' | 'ollama'
-  model TEXT,                  -- 'gemini-2.5-flash' | 'llama3.1:8b'
+  model TEXT,                  -- 'gemini-2.5-flash' | 'phi3:mini' | 'llama3.1:8b'
   tokens_used INTEGER,
   latency_ms INTEGER,
   created_at TEXT DEFAULT (datetime('now'))
@@ -230,6 +230,50 @@ App bundle contains:
 **Rust reads YAML** → parses into `PersonalityConfig` struct → sends to frontend via Tauri events or `invoke` return values.
 
 The system prompt from YAML gets prepended to every Ollama/Gemini request, same as the current Python backend.
+
+**Per-personality local model** — each YAML now includes a `local_model` field:
+
+```yaml
+# aria.yaml
+local_model: phi3:mini      # strong reasoning, task-oriented
+
+# echo.yaml
+local_model: llama3.2:3b    # better creative writing, conversational
+
+# nexus.yaml
+local_model: phi3:mini      # precise, good at code
+```
+
+The Rust provider reads `personality_config.local_model` — no if-statement, no
+hardcoded mapping. Users can override this per-personality in Settings without
+touching any code. The model name flows straight into the Ollama API request.
+
+### 3.4.1 Cold-Start Loading State
+
+When switching personalities with different local models (e.g., ARIA → ECHO),
+the new model needs ~2-3s to load if it's not already in RAM. During this
+window the app must not feel broken.
+
+**Required UI behavior:**
+
+1. User switches personality (Cmd+2, voice wake word, or UI click)
+2. PersonalityOrb immediately transitions to ECHO's color/animation
+3. If the model isn't loaded yet:
+   - PersonalityOrb enters a **pulsing/breathing state** (slower, wider pulse)
+   - A subtle label appears below the orb: "Loading model..."
+   - InputBar is **not disabled** — user can type, message queues
+4. First token arrives from Ollama → loading state resolves instantly
+   - Orb returns to normal animation
+   - Label disappears
+   - Queued message starts streaming response
+5. If model load fails (Ollama down, model deleted):
+   - Orb shows error state (brief red flash)
+   - Toast: "Couldn't load local model. Trying cloud..."
+   - Provider router falls back to Gemini
+
+**Why this matters:** In a continuous conversation app where the mic is always
+live, a 2-3 second silence with no visual feedback feels broken. Users will
+think TRINITY crashed. The pulsing orb bridges the gap.
 
 ### 3.5 Window Management
 
@@ -513,10 +557,11 @@ pub struct ChatMessage {
 1. User types message in InputBar
 2. React calls: invoke('send_message', { message, personality, history })
 3. Rust command:
-   a. Load personality YAML → get system_prompt
+   a. Load personality YAML → get system_prompt + local_model
    b. Provider router decides: Gemini or Ollama
-   c. Build messages array: [system, ...history, user_message]
-   d. Call provider.chat_stream(messages, system_prompt, tx)
+   c. If Ollama → use personality_config.local_model (e.g., "phi3:mini" or "llama3.2:3b")
+   d. Build messages array: [system, ...history, user_message]
+   e. Call provider.chat_stream(messages, system_prompt, tx)
    e. For each token received:
       - Emit Tauri event: app.emit("chat_token", token)
       - Accumulate full response
@@ -571,8 +616,8 @@ pub struct ChatMessage {
 4. After Ollama detected + version OK, check models:
    - GET localhost:11434/api/tags → list installed models
    - If no suitable model → prompt to download
-   - Recommended: llama3.1:8b (4.7GB)
-   - Budget option: phi3:mini (2.3GB)
+   - Default: phi3:mini Q4 (~1.8GB download, ~1.8GB RAM)
+   - Power option: llama3.1:8b (~4.7GB download, ~4.7GB RAM)
    - Show download progress bar
 ```
 
@@ -601,8 +646,36 @@ fn cleanup_ollama() {
 }
 ```
 
+### Memory Strategy: Lazy Load + Keep-Alive Timeout
+
+The default model (phi3:mini Q4) uses ~1.8GB when loaded. To keep idle
+RAM low, we use Ollama's `keep_alive` parameter:
+
+```
+Every Ollama chat request includes:
+  "keep_alive": "5m"
+
+This means:
+  - Model stays in RAM for 5 minutes after last request
+  - After 5 minutes idle → Ollama auto-unloads the model
+  - Next message triggers a re-load (~2-3s cold start)
+  - During active conversation → model stays hot, no delay
+```
+
+**Lazy load:** Don't pre-load the model on app launch. The model only
+loads when the user sends their first local message. This means the app
+launches at ~130MB and only jumps to ~1.9GB when actually chatting.
+
+**User-facing:** Show a brief "Loading model..." indicator on first
+message (and after idle timeout). After the first token arrives, the
+indicator disappears and streaming feels normal.
+
+**Configurable:** Settings panel has a keep-alive slider (1m / 5m / 30m / forever).
+Power users who want instant responses can set "forever" and accept the RAM cost.
+
 ### Health Monitoring
 - Background task: ping `localhost:11434` every 30 seconds
+- Monitor model load state via `GET /api/ps` (shows loaded models + RAM)
 - If Ollama dies unexpectedly → restart it
 - If restart fails 3x → switch to cloud-only mode, notify user
 - Status shown in system tray and settings panel
@@ -645,22 +718,25 @@ New React component: `src/components/settings/SettingsPanel.tsx`
 - Links: GitHub, docs, feedback
 - **Memory usage breakdown** (always visible in About panel):
   ```
-  TRINITY app:     ~80 MB
-  Ollama runtime:  ~200 MB
-  Loaded model:    ~4.7 GB (llama3.1:8b)
-  ─────────────────────────
-  Total:           ~5.0 GB
+  Active (model loaded):
+    TRINITY app:     ~80 MB
+    Ollama runtime:  ~50 MB
+    Loaded model:    ~1.8 GB (phi3:mini Q4)
+    ─────────────────────────
+    Total:           ~1.9 GB
+
+  Idle (5min after last message):
+    TRINITY app:     ~80 MB
+    Ollama runtime:  ~50 MB
+    Model:           unloaded (0 MB)
+    ─────────────────────────
+    Total:           ~130 MB
   ```
-  This is critical. Users WILL open Activity Monitor, see 5GB usage, and
-  think TRINITY is broken. The About panel must show a clear breakdown:
-  - TRINITY process (our code, WebView, SQLite)
-  - Ollama process (runtime overhead)
-  - Model weights (the bulk — this is normal, the model lives in RAM)
-  Include a tooltip or info link: "Large language models must be loaded
-  into memory to run. This is expected. Use a smaller model (phi3:mini,
-  ~2.3GB) to reduce memory usage."
-  Also surface this in the system tray tooltip:
-  `"TRINITY — Local AI (llama3.1:8b, ~5GB RAM)"`
+  The About panel shows this breakdown live (pull actual values from
+  Ollama's `/api/ps` endpoint). Include a note: "The model loads into
+  memory when you chat and unloads after 5 minutes of inactivity."
+  System tray tooltip: `"TRINITY — Local AI (phi3:mini, idle)"`
+  or `"TRINITY — Local AI (phi3:mini, ~1.9GB active)"`
 
 ---
 
@@ -842,7 +918,7 @@ npx tauri build        # Production .app bundle
 |----------|--------|-----------|
 | Desktop framework | Tauri v2 | 30x smaller than Electron, native macOS feel, Rust performance |
 | Local LLM runtime | Ollama | Easiest integration, REST API, Metal acceleration, model marketplace |
-| Default model | llama3.1:8b | Best quality at 8B params, runs well on 8GB+ M-series Macs |
+| Default model | phi3:mini (Q4) | ~1.8GB RAM, strong reasoning, fits comfortably on 8GB Macs. Power users can switch to llama3.1:8b in settings |
 | Local database | SQLite via rusqlite | No external service, single file, fast, perfect for local app |
 | Config storage | tauri-plugin-store | Encrypted at rest, no plaintext API keys on disk |
 | Backend embedding | No embedded Python | Too complex; Rust handles local ops, Python backend optional for cloud |
@@ -876,7 +952,7 @@ npx tauri build        # Production .app bundle
 2. First token from Ollama in < 500ms (after model loaded)
 3. Seamless Gemini → Ollama fallback (user sees a toast, no interruption)
 4. Bundle size < 15MB (excluding Ollama + model)
-5. Memory usage < 100MB idle (TRINITY process only, excluding Ollama — see note below)
+5. Memory usage < 130MB idle (TRINITY + Ollama runtime, model unloaded after 5m keep-alive)
 6. All existing web app features work in desktop (chat, personalities, voice, orb)
 7. Global hotkey works from any app
 8. System tray with personality switching works
