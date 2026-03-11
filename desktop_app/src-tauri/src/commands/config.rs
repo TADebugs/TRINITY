@@ -1,4 +1,5 @@
 use tauri::State;
+use rusqlite::OptionalExtension;
 use crate::db::AppDb;
 
 #[tauri::command]
@@ -32,5 +33,3 @@ pub fn delete_preference(key: String, db: State<'_, AppDb>) -> Result<(), String
         .map_err(|e| e.to_string())?;
     Ok(())
 }
-
-use rusqlite::OptionalExtension;

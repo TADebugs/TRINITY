@@ -1,10 +1,10 @@
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use std::sync::Mutex;
 
 pub struct AppDb(pub Mutex<rusqlite::Connection>);
 
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let app_dir = app.path().app_data_dir()?;
+    let app_dir = app.path().app_data_dir().map_err(|e| format!("Failed to get app data dir: {}", e))?;
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("trinity.db");
     let conn = rusqlite::Connection::open(db_path)?;
